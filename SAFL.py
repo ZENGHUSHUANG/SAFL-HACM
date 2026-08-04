@@ -215,11 +215,6 @@ if __name__=='__main__':
             weights, K= device.send_weight()
             current_devices.append(idx)
             ready_weights[idx] = copy.deepcopy(weights)
-            # gl = copy.deepcopy(global_weights)
-            # for key in gl.keys():
-            #     gl[key] = gl[key]/K
-            # ready_c[idx] = copy.deepcopy(gl)
-            # ready_c[idx] = copy.deepcopy(weights)
             ready_c[idx] = K
             ready_losses[idx] = loss
             update_age[idx] = device.global_age
@@ -275,33 +270,7 @@ if __name__=='__main__':
         # 带宽分配
         T = Bandwidth_Allocation(aggregation_idx, channel_cap)
         print("传输时间 = ", T)
-
-        # 余弦相似权重
-        # total_w = 0
-        # ww = {}
-        # wwl = []
-        # N = 0
-        # for idx in aggregation_idx:
-        #     if round == 0:
-        #         ww[idx] = 1
-        #         break
-        #     g_weights = copy.deepcopy(global_buffer[update_age[idx]%10])
-        #     w = copy.deepcopy(g_weights)
-        #     for key in weights.keys():
-        #         w[key] = global_weights[key] - g_weights[key]
-        #     ww[idx] = cosine_similarity(w, ready_weights[idx])
-        #     if ww[idx] < 0:
-        #         N = N + 1
-        #     ww[idx] = torch.exp(ww[idx]) * devices[idx].data_size
-        #     total_w += ww[idx]
-        # if round == 0:
-        #     for idx in aggregation_idx:
-        #         ww[idx] = 1
-        #         total_w += 1
-        # for idx in aggregation_idx:
-        #     ww[idx] = ww[idx] / total_w
-        # print("负权重 = ", N)
-
+        
         # 平均权重
         ww = {}
         for idx in aggregation_idx:
@@ -316,14 +285,6 @@ if __name__=='__main__':
         for idx in aggregation_idx:
             total_age += round - update_age[idx]
             ages.append(round - update_age[idx])
-        #     # ww[idx] = devices[idx].data_size * (a**(round - update_age[idx]))
-        #     ww[idx] = devices[idx].data_size
-        #     total_size += ww[idx]
-        #     # total_ALU = total_ALU + ww[idx]
-        # # for idx in aggregation_idx:
-        # #     ww[idx] =  ww[idx] / total_ALU
-        # for idx in aggregation_idx:
-        #     ww[idx] =  ww[idx] / total_size
         avg = total_age / R
         print("平均年龄 = ", total_age / R)
         d = 1
@@ -334,20 +295,7 @@ if __name__=='__main__':
         # 伪梯度计算
         g_weights = ALU_aggregation_weight(ww, aggregation_idx, ready_weights)
         g_c = Aggregation_Weight_g(ww, aggregation_idx, ready_weights, ready_c)
-        # b =  b * 0.9
-        # print("b = ", b)    
-        # for key in g_weights.keys():
-        #     if round == 0:
-        #         mt[key] = g_weights[key]
-        #     else:
-        #         mt[key] = beta1 * mt[key] + (1 - beta1) * g_weights[key]
-        #     # vt[key] = beta2 * vt[key] + (1 - beta2) * g_weights[key] * g_weights[key]
-        #     # vt[key] = vt[key] / (1 - beta2)
-        #     mt_0[key] = beta1 * mt[key] + (1 - beta1) * g_weights[key]
-        #     # mt_0[key] = mt[key] / (1 - b)
-        #     # print(torch.sqrt(vt[key]))
 
-        #     global_weights[key] = global_weights[key] + mt_0[key]、
         if round == 0:
             global_c = copy.deepcopy(g_c)
         else:
@@ -413,10 +361,6 @@ if __name__=='__main__':
                 loss = device.send_loss()
                 weights, K = device.send_weight()
                 ready_weights[idx] = copy.deepcopy(weights)
-                # gl = copy.deepcopy(weights)
-                # for key in gl.keys():
-                #     gl[key] = gl[key]/K
-                # ready_c[idx] = copy.deepcopy(gl)
                 ready_c[idx] = K
                 ready_losses[idx] = loss
                 if idx not in devices_kind[device.kind]:
@@ -438,15 +382,9 @@ if __name__=='__main__':
         for idx in current_devices:
             devices[idx].local_train()
         current_devices = []
-        # with open('./save/AFLDCh_le{}_iid{}_ds_{}.csv'.format(args.local_ep, args.iid, args.dataset), mode='a', newline='') as file:
-        #     writer = csv.writer(file)
-        #     writer.writerow([round, test_acc, test_loss, epochs_time[-1]])
         with open('./save/AFLDCh_le{}_iid{}_ds_{}_dir{}.csv'.format(args.local_ep, args.iid, args.dataset, args.dir), mode='a', newline='') as file:
             writer = csv.writer(file)
             writer.writerow([round, test_acc, test_loss, epochs_time[-1]])
-        # with open('./save/AFLDCh3_le{}_iid{}_ds_{}_lr_{}.csv'.format(args.local_ep, args.iid, args.dataset, args.lr), mode='a', newline='') as file:
-        #     writer = csv.writer(file)
-        #     writer.writerow([round, test_acc, test_loss, epochs_time[-1]])
     n = 0
     
 
