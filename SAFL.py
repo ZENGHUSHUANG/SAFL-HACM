@@ -307,19 +307,6 @@ if __name__=='__main__':
         for key in global_weights.keys():
             global_weights[key] = global_weights[key] + lr * g_weights[key]
 
-        #计算年龄
-        # total_ALU = 0
-        # total_age = 0
-        # for idx in aggregation_idx:
-        #     total_age += round - update_age[idx]
-        # avg_age = total_age / R
-        # if avg_age == 0:
-        #     avg_age = 1
-        # glr = 3 / (avg_age + 2)
-        # print("glr = ", glr)
-        # for key in global_weights.keys():
-        #     global_weights[key] = (1-glr) * global_weights[key] + glr * g_weights[key]
-    
         global_buffer[ (round + 1)%10 ] = copy.deepcopy(global_weights)
         ## 更新全局模型
         global_model.load_state_dict(global_weights)    
