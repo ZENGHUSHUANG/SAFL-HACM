@@ -127,12 +127,9 @@ if __name__=='__main__':
         ## 加载初始模型
         global_model.load_state_dict(torch.load("./save/origin_model.pth"))
     else:
-        # global_model = AlexNetCIFAR()
         global_model = CNNCifar()
         global_model.load_state_dict(torch.load("./save/CNNcifar.pth"))
-        # global_model = ResNet18()
-        # global_model.load_state_dict(torch.load("./save/r4.pth"))
-        # global_model.load_state_dict(torch.load("./save/alexnet.pth"))
+
     global_model.to(device)
 
     #复制全局模型参数
@@ -276,10 +273,6 @@ if __name__=='__main__':
         for idx in aggregation_idx:
             ww[idx] = 1.0 / R
 
-        # ww = {}
-        # 年龄权重模型
-        # total_ALU = 0
-        # total_size = 0
         total_age = 0
         ages = []
         for idx in aggregation_idx:
@@ -291,7 +284,7 @@ if __name__=='__main__':
         if avg > 2:
             d = 0.6
         lr = d * 0.5
-        # print("聚合权重 :", ww)
+        
         # 伪梯度计算
         g_weights = ALU_aggregation_weight(ww, aggregation_idx, ready_weights)
         g_c = Aggregation_Weight_g(ww, aggregation_idx, ready_weights, ready_c)
@@ -301,9 +294,7 @@ if __name__=='__main__':
         else:
             for key in g_c.keys():
                 global_c[key] = 0.6 * global_c[key] + 0.4 * g_c[key]
-        # print("全局校正项 = ", global_c)
 
-        # global_weights = copy.deepcopy(g_weights)
         for key in global_weights.keys():
             global_weights[key] = global_weights[key] + lr * g_weights[key]
 
@@ -316,8 +307,6 @@ if __name__=='__main__':
         test_acc, test_loss = test_inference(args, global_model, test_dataset)
         epochs_acc.append(test_acc)
         print("Round = ", round, "Accuracy = ", test_acc, "Loss = ", test_loss, "Time = ", epochs_time[-1])
-
-
 
         #标记未被选用过
         for idx in range(num_devices):
