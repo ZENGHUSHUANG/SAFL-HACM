@@ -1,369 +1,778 @@
-import os
-from tqdm import tqdm
+"""
+SAFL-HACM refactor (reference implementation)
+Based on the paper:
+"Semi-Asynchronous Federated Learning with Heterogeneity-Aware Coordination Mechanism
+ in Mobile Edge Computing Networks"
+
+This file focuses on the key components and is designed to be integrated with the
+existing Edge_Device / dataset / model code.
+
+Key paper-aligned components:
+1) Age-aware model and learning rate
+2) Local Drift Control (LDC)
+3) Cluster-balanced / participation-aware scheduling
+4) Latency-aware bandwidth allocation
+5) Data-size-weighted pseudo-gradient aggregation
+6) Buffered semi-asynchronous update lifecycle
+"""
+
+from __future__ import annotations
+
 import copy
-import time
-import numpy as np
+import math
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+
 import torch
-from torch import nn
-from torch.utils.data import DataLoader, Dataset
-from models import CNNMnist, AlexNetCIFAR, CNNCifar
-from utils import get_dataset, ALU_aggregation_weight, get_local_time, get_transmission_rate, Aggregation_Weight_g
-from cluster import cluster
-from BA import Bandwidth_Allocation
-from devices import Edge_Device
-import argparse
-import random
-import csv
-from schedule_policy import schedule
-from ed import euclidean_distance, calculate_l2_norm, cosine_similarity, cosine_similarity1, calculate_dot
-from resnet import ResNet18
 
-def args_parser():
-    parser = argparse.ArgumentParser()
+TensorDict = Dict[str, torch.Tensor]
 
-    # federated arguments (Notation for the arguments followed from paper)
-    parser.add_argument('--epochs', type=int, default=500,
-                        help="number of rounds of training")
-    parser.add_argument('--num_devices', type=int, default=100,
-                        help="number of users: K")
-    parser.add_argument('--frac', type=float, default=0.1,
-                        help='the fraction of clients: C')
-    parser.add_argument('--local_ep', type=int, default=10,
-                        help="the number of local epochs: E")
-    parser.add_argument('--local_bs', type=int, default=32,
-                        help="local batch size: B")
-    parser.add_argument('--lr', type=float, default=0.01,
-                        help='learning rate')
-    parser.add_argument('--momentum', type=float, default=0.5,
-                        help='SGD momentum (default: 0.5)')
-    
-    # model arguments
-    parser.add_argument('--model', type=str, default='CNN', help='model name')
-    parser.add_argument('--kernel_num', type=int, default=9,
-                        help='number of each kind of kernel')
-    parser.add_argument('--kernel_sizes', type=str, default='3,4,5',
-                        help='comma-separated kernel size to \
-                        use for convolution')
-    parser.add_argument('--num_channels', type=int, default=1, help="number \
-                        of channels of imgs")
-    parser.add_argument('--norm', type=str, default='batch_norm',
-                        help="batch_norm, layer_norm, or None")
-    parser.add_argument('--num_filters', type=int, default=32,
-                        help="number of filters for conv nets -- 32 for \
-                        mini-imagenet, 64 for omiglot.")
-    parser.add_argument('--max_pool', type=str, default='True',
-                        help="Whether use max pooling rather than \
-                        strided convolutions")
 
-    # other arguments
-    parser.add_argument('--dir', type=float, default=1, help="dirichlet distribution parameter")
-    parser.add_argument('--dataset', type=str, default='mnist', help="name \
-                        of dataset")
-    parser.add_argument('--num_classes', type=int, default=10, help="number \
-                        of classes")
-    parser.add_argument('--gpu', default=None, help="To use cuda, set \
-                        to a specific GPU ID. Default set to use CPU.")
-    parser.add_argument('--optimizer', type=str, default='sgd', help="type \
-                        of optimizer")
-    parser.add_argument('--iid', type=int, default=1,
-                        help='Default set to IID. Set to 2 for non-IID.')
-    parser.add_argument('--unequal', type=int, default=0,
-                        help='whether to use unequal data splits for  \
-                        non-i.i.d setting (use 0 for equal splits)')
-    parser.add_argument('--seed', type=int, default=1, help='random seed')
-    parser.add_argument('--stale', type=int, default=5, help='staleness ')
-    args = parser.parse_args()
-    return args
-def test_inference(args, model, test_dataset):
-    """ Returns the test accuracy and loss.
+# ---------------------------------------------------------------------
+# Tensor-dict helpers
+# ---------------------------------------------------------------------
+
+def zeros_like_state(state: Mapping[str, torch.Tensor]) -> TensorDict:
+    return {k: torch.zeros_like(v) for k, v in state.items()}
+
+
+def clone_state(state: Mapping[str, torch.Tensor]) -> TensorDict:
+    return {k: v.detach().clone() for k, v in state.items()}
+
+
+def state_sub(a: Mapping[str, torch.Tensor],
+              b: Mapping[str, torch.Tensor]) -> TensorDict:
+    """a - b."""
+    return {k: a[k] - b[k] for k in a.keys()}
+
+
+def state_add_scaled_(dst: MutableMapping[str, torch.Tensor],
+                      src: Mapping[str, torch.Tensor],
+                      scale: float) -> None:
+    with torch.no_grad():
+        for k in dst.keys():
+            dst[k].add_(src[k], alpha=scale)
+
+
+# ---------------------------------------------------------------------
+# Buffered update used by semi-asynchronous server
+# ---------------------------------------------------------------------
+
+@dataclass
+class BufferedUpdate:
+    client_id: int
+    start_round: int              # s_k(t): global model index used to start local training
+    pseudo_grad: TensorDict       # g_k^t = w_start - w_end
+    local_steps: int              # K_k / E_k
+    local_lr: float               # eta_k
+    local_loss: float             # F_{k,t}
+    num_samples: int              # |D_k|
+
+    @property
+    def local_avg_grad(self) -> TensorDict:
+        denom = max(self.local_steps * self.local_lr, 1e-12)
+        return {k: v / denom for k, v in self.pseudo_grad.items()}
+
+
+# ---------------------------------------------------------------------
+# 1. Age-aware model, paper Eq. (6)
+# ---------------------------------------------------------------------
+
+def update_age(current_round: int, start_round: int) -> int:
+    """a_{k,t} = t - s_k(t)."""
+    return max(0, current_round - start_round)
+
+
+def age_aware_global_lr(
+    base_lr: float,
+    ages: Sequence[int],
+    age_threshold: float,
+    decay: float,
+) -> float:
+    """
+    Paper Eq. (6):
+        eta_t = eta,                         if avg_age <= a_c
+              = eta * epsilon^(avg_age-a_c), otherwise
+
+    decay must be in (0, 1).
+    """
+    if not ages:
+        return base_lr
+    if not (0.0 < decay < 1.0):
+        raise ValueError("decay must be in (0, 1).")
+
+    avg_age = sum(ages) / len(ages)
+    if avg_age <= age_threshold:
+        return base_lr
+    return base_lr * (decay ** (avg_age - age_threshold))
+
+
+# ---------------------------------------------------------------------
+# 2. Local Drift Control (LDC), paper Eq. (13)-(19)
+# ---------------------------------------------------------------------
+
+def ldc_objective(
+    model: torch.nn.Module,
+    empirical_loss: torch.Tensor,
+    stale_global_state: Mapping[str, torch.Tensor],
+    drift_state: Mapping[str, torch.Tensor],
+    global_grad_ref: Mapping[str, torch.Tensor],
+    local_grad_ref: Mapping[str, torch.Tensor],
+    alpha: float,
+    beta: float,
+) -> torch.Tensor:
+    """
+    Paper Eq. (13), (15), (16).
+
+    L_k = ||v_k - (w - w_k)||^2
+
+    G_k is represented as the parameter inner product with the difference between
+    the global gradient reference and the local gradient reference.
+
+    IMPORTANT:
+    global_grad_ref / local_grad_ref are treated as fixed references for this
+    local optimization step. The caller should pass the references corresponding
+    to the model version used by the device.
+    """
+    named_params = dict(model.named_parameters())
+
+    drift_penalty = empirical_loss.new_zeros(())
+    direction_term = empirical_loss.new_zeros(())
+
+    for name, p in named_params.items():
+        if name not in stale_global_state:
+            continue
+
+        v = drift_state[name].detach().to(device=p.device, dtype=p.dtype)
+        w_ref = stale_global_state[name].detach().to(device=p.device, dtype=p.dtype)
+
+        drift_penalty = drift_penalty + torch.sum((v - (w_ref - p)) ** 2)
+
+        if name in global_grad_ref and name in local_grad_ref:
+            g_global = global_grad_ref[name].detach().to(device=p.device, dtype=p.dtype)
+            g_local = local_grad_ref[name].detach().to(device=p.device, dtype=p.dtype)
+            direction_term = direction_term + torch.sum(p * (g_global - g_local))
+
+    return empirical_loss + 0.5 * alpha * direction_term + beta * drift_penalty
+
+
+def update_ldv(
+    old_v: Mapping[str, torch.Tensor],
+    start_state: Mapping[str, torch.Tensor],
+    end_state: Mapping[str, torch.Tensor],
+    phi: float,
+) -> TensorDict:
+    """
+    Paper Eq. (18):
+        v_k <- (1-phi) v_k + phi (w_end - w_start)
+    """
+    if not (0.0 < phi < 1.0):
+        raise ValueError("phi must be in (0, 1).")
+
+    out = {}
+    for k in old_v.keys():
+        out[k] = (1.0 - phi) * old_v[k] + phi * (end_state[k] - start_state[k])
+    return out
+
+
+def stale_drift_correction(
+    pseudo_grad: Mapping[str, torch.Tensor],
+    drift_state: Mapping[str, torch.Tensor],
+    age: int,
+    rho: float,
+) -> TensorDict:
+    """
+    Paper Eq. (19):
+        g_k^t <- g_k^t - rho * a_{k,t} * v_k
+    """
+    return {
+        k: pseudo_grad[k] - rho * float(age) * drift_state[k]
+        for k in pseudo_grad.keys()
+    }
+
+
+def update_global_average_gradient(
+    previous: Mapping[str, torch.Tensor],
+    selected_updates: Sequence[BufferedUpdate],
+    mu: float,
+) -> TensorDict:
+    """
+    Paper Eq. (14):
+        gbar^t = mu*gbar^(t-1)
+               + (1-mu) * (1/R) * sum_k [g_k^t / (K_k * eta_k)]
+    """
+    if not selected_updates:
+        return clone_state(previous)
+    if not (0.0 <= mu < 1.0):
+        raise ValueError("mu must be in [0, 1).")
+
+    avg = zeros_like_state(previous)
+    R = len(selected_updates)
+
+    for upd in selected_updates:
+        denom = max(upd.local_steps * upd.local_lr, 1e-12)
+        for name in avg.keys():
+            avg[name].add_(upd.pseudo_grad[name] / denom, alpha=1.0 / R)
+
+    return {
+        name: mu * previous[name] + (1.0 - mu) * avg[name]
+        for name in previous.keys()
+    }
+
+
+# ---------------------------------------------------------------------
+# 3. Cluster-balanced scheduling, paper Eq. (25)-(26), Algorithm 3
+# ---------------------------------------------------------------------
+
+def contribution_score(local_loss: float, participation_count: int) -> float:
+    """
+    Paper Eq. (25):
+        gamma_k = F_{k,t} / (vartheta_{k,t} + 1)
+    """
+    return float(local_loss) / (float(participation_count) + 1.0)
+
+
+def cluster_balanced_schedule(
+    cluster_of: Mapping[int, int],
+    ready_ids: Iterable[int],
+    nonready_ids: Iterable[int],
+    local_losses: Mapping[int, float],
+    participation_count: Mapping[int, int],
+    remaining_compute: Mapping[int, float],
+    estimated_comm_latency: Mapping[int, float],
+    R: int,
+) -> List[int]:
+    """
+    Paper Algorithm 3:
+    - Prefer eligible ready updates in every cluster.
+    - Within a ready cluster, choose max gamma_k.
+    - If a cluster has no ready update, choose the non-ready device with minimum
+      remaining-computation + estimated-communication latency.
+    - Cycle over clusters until R devices have been selected.
+
+    Stale ready updates should be filtered BEFORE calling this function.
+    """
+    ready = set(ready_ids)
+    nonready = set(nonready_ids)
+
+    cluster_ids = sorted(set(cluster_of.values()))
+    ready_by_cluster = {
+        c: [k for k in ready if cluster_of[k] == c]
+        for c in cluster_ids
+    }
+    waiting_by_cluster = {
+        c: [k for k in nonready if cluster_of[k] == c]
+        for c in cluster_ids
+    }
+
+    selected: List[int] = []
+    selected_set = set()
+
+    while len(selected) < R:
+        progress = False
+
+        for c in cluster_ids:
+            if len(selected) >= R:
+                break
+
+            candidates = [k for k in ready_by_cluster[c] if k not in selected_set]
+            if candidates:
+                k_star = max(
+                    candidates,
+                    key=lambda k: contribution_score(
+                        local_losses.get(k, 0.0),
+                        participation_count.get(k, 0),
+                    ),
+                )
+            else:
+                candidates = [k for k in waiting_by_cluster[c] if k not in selected_set]
+                if not candidates:
+                    continue
+                k_star = min(
+                    candidates,
+                    key=lambda k: (
+                        remaining_compute.get(k, math.inf)
+                        + estimated_comm_latency.get(k, math.inf)
+                    ),
+                )
+
+            selected.append(k_star)
+            selected_set.add(k_star)
+            progress = True
+
+        if not progress:
+            break
+
+    return selected
+
+
+# ---------------------------------------------------------------------
+# 4. Latency-aware bandwidth allocation, paper Eq. (27)-(32)
+# ---------------------------------------------------------------------
+
+def communication_coefficient(
+    model_size: float,
+    channel_gain: float,
+    tx_power: float,
+    noise_psd: float,
+) -> float:
+    """
+    alpha_k = S / log2(1 + G_k P_k / N0)
+
+    With this definition:
+        H_cm = alpha_k / b_k
+    """
+    snr = channel_gain * tx_power / max(noise_psd, 1e-30)
+    spectral_eff = math.log2(1.0 + snr)
+    if spectral_eff <= 0:
+        return math.inf
+    return model_size / spectral_eff
+
+
+def latency_aware_bandwidth_allocation(
+    selected: Sequence[int],
+    total_bandwidth: float,
+    alpha: Mapping[int, float],
+    remaining_compute: Mapping[int, float],
+    tol: float = 1e-7,
+    max_iter: int = 200,
+) -> Tuple[Dict[int, float], float]:
+    """
+    Solve:
+        min max_k { H_cp[k] + alpha[k] / b[k] }
+        s.t. sum b[k] <= B, b[k] >= 0
+
+    Not-waiting case:
+        H_cp[k] = 0 for all selected k
+        b_k = alpha_k / sum(alpha) * B        (paper Eq. 32)
+
+    Waiting case:
+        b_k = alpha_k / (H - H_cp[k])
+    and H is found by binary search so that sum b_k = B.
+    """
+    if not selected:
+        return {}, 0.0
+    if total_bandwidth <= 0:
+        raise ValueError("total_bandwidth must be positive.")
+
+    selected = list(selected)
+    hcp = {k: max(0.0, float(remaining_compute.get(k, 0.0))) for k in selected}
+
+    # Closed-form case (paper Sec. 4.4.1 / Eq. 32)
+    if all(v <= tol for v in hcp.values()):
+        denom = sum(alpha[k] for k in selected)
+        if denom <= 0:
+            raise ValueError("sum(alpha) must be positive.")
+        bw = {k: total_bandwidth * alpha[k] / denom for k in selected}
+        H = max(alpha[k] / max(bw[k], 1e-30) for k in selected)
+        return bw, H
+
+    # Waiting case: binary search on equalized completion time H.
+    low = max(hcp.values()) + tol
+
+    def required_bw(H: float) -> float:
+        total = 0.0
+        for k in selected:
+            denom = H - hcp[k]
+            if denom <= 0:
+                return math.inf
+            total += alpha[k] / denom
+        return total
+
+    # Find a feasible upper bound.
+    high = low + max(sum(alpha[k] for k in selected) / total_bandwidth, 1.0)
+    for _ in range(100):
+        if required_bw(high) <= total_bandwidth:
+            break
+        high = low + 2.0 * (high - low)
+    else:
+        raise RuntimeError("Failed to bracket bandwidth-allocation solution.")
+
+    for _ in range(max_iter):
+        mid = 0.5 * (low + high)
+        need = required_bw(mid)
+
+        if abs(need - total_bandwidth) <= tol * max(total_bandwidth, 1.0):
+            low = high = mid
+            break
+
+        if need > total_bandwidth:
+            low = mid
+        else:
+            high = mid
+
+    H = 0.5 * (low + high)
+    bw = {k: alpha[k] / max(H - hcp[k], 1e-30) for k in selected}
+
+    # Small numerical normalization to use exactly the bandwidth budget.
+    s = sum(bw.values())
+    if s > 0:
+        scale = total_bandwidth / s
+        bw = {k: v * scale for k, v in bw.items()}
+
+    H_actual = max(hcp[k] + alpha[k] / max(bw[k], 1e-30) for k in selected)
+    return bw, H_actual
+
+
+# ---------------------------------------------------------------------
+# 5. Server aggregation, paper Eq. (4)-(5)
+# ---------------------------------------------------------------------
+
+def data_size_weights(
+    selected_updates: Sequence[BufferedUpdate],
+) -> Dict[int, float]:
+    total = sum(max(0, u.num_samples) for u in selected_updates)
+    if total <= 0:
+        # Safe fallback only when sample counts are unavailable.
+        w = 1.0 / max(len(selected_updates), 1)
+        return {u.client_id: w for u in selected_updates}
+    return {u.client_id: u.num_samples / total for u in selected_updates}
+
+
+def aggregate_pseudogradient(
+    selected_updates: Sequence[BufferedUpdate],
+) -> TensorDict:
+    """
+    Delta_t = sum theta_k(t) * g_k^t
+    """
+    if not selected_updates:
+        raise ValueError("selected_updates must be non-empty.")
+
+    weights = data_size_weights(selected_updates)
+    delta = zeros_like_state(selected_updates[0].pseudo_grad)
+
+    for upd in selected_updates:
+        theta = weights[upd.client_id]
+        for name in delta.keys():
+            delta[name].add_(upd.pseudo_grad[name], alpha=theta)
+
+    return delta
+
+
+def global_model_update(
+    global_state: Mapping[str, torch.Tensor],
+    delta_t: Mapping[str, torch.Tensor],
+    eta_t: float,
+) -> TensorDict:
+    """
+    Paper Eq. (4):
+        w^{t+1} = w^t - eta_t * Delta_t
+
+    This sign assumes pseudo_grad = w_start - w_end exactly as defined in the paper.
+    """
+    return {
+        name: global_state[name] - eta_t * delta_t[name]
+        for name in global_state.keys()
+    }
+
+
+# ---------------------------------------------------------------------
+# 6. Buffer lifecycle helpers
+# ---------------------------------------------------------------------
+
+def discard_stale_buffered_updates(
+    buffer: MutableMapping[int, BufferedUpdate],
+    current_round: int,
+    staleness_tolerance: int,
+) -> List[int]:
+    """
+    Paper behavior:
+    - Unscheduled completed updates remain buffered.
+    - Discard only when age exceeds kappa.
+    """
+    removed = []
+    for k, upd in list(buffer.items()):
+        if update_age(current_round, upd.start_round) > staleness_tolerance:
+            removed.append(k)
+            del buffer[k]
+    return removed
+
+
+def replace_with_fresher_update(
+    buffer: MutableMapping[int, BufferedUpdate],
+    new_update: BufferedUpdate,
+) -> None:
+    """
+    If the same ED generates a fresher update before its old update is scheduled,
+    keep the fresher one.
+    """
+    old = buffer.get(new_update.client_id)
+    if old is None or new_update.start_round >= old.start_round:
+        buffer[new_update.client_id] = new_update
+
+
+
+
+# ---------------------------------------------------------------------
+# Full paper-aligned two-stage aggregation cycle
+# ---------------------------------------------------------------------
+
+def plan_aggregation_cycle(
+    *,
+    t: int,
+    send_buffer: MutableMapping[int, BufferedUpdate],
+    cluster_of: Mapping[int, int],
+    all_client_ids: Sequence[int],
+    participation_count: Mapping[int, int],
+    running_local_losses: Mapping[int, float],
+    remaining_compute: Mapping[int, float],
+    estimated_comm_latency: Mapping[int, float],
+    alpha_comm: Mapping[int, float],
+    R: int,
+    kappa: int,
+    total_bandwidth: float,
+) -> Tuple[List[int], Dict[int, float], float]:
+    """
+    Stage A of one SAFL-HACM aggregation cycle.
+
+    1. Remove only expired buffered updates.
+    2. Build Omega(t) (ready) and Gamma(t) (not ready).
+    3. Schedule R EDs with Algorithm 3.
+    4. Allocate bandwidth by Eq. (27)-(32), INCLUDING remaining local
+       computation time for selected EDs in Gamma(t).
+
+    Returns:
+        selected, bandwidth, H_t
+
+    The simulator should then advance virtual time by H_t. During this interval,
+    ongoing local training is NOT interrupted. Once every selected ED's update
+    has become available, call finalize_aggregation_cycle().
+    """
+    discard_stale_buffered_updates(send_buffer, t, kappa)
+
+    ready_ids = set(send_buffer.keys())
+    nonready_ids = [k for k in all_client_ids if k not in ready_ids]
+
+    losses = dict(running_local_losses)
+    for k in ready_ids:
+        losses[k] = send_buffer[k].local_loss
+
+    selected = cluster_balanced_schedule(
+        cluster_of=cluster_of,
+        ready_ids=ready_ids,
+        nonready_ids=nonready_ids,
+        local_losses=losses,
+        participation_count=participation_count,
+        remaining_compute=remaining_compute,
+        estimated_comm_latency=estimated_comm_latency,
+        R=R,
+    )
+
+    if not selected:
+        return [], {}, 0.0
+
+    bw, H_t = latency_aware_bandwidth_allocation(
+        selected=selected,
+        total_bandwidth=total_bandwidth,
+        alpha=alpha_comm,
+        remaining_compute=remaining_compute,
+    )
+    return selected, bw, H_t
+
+
+def finalize_aggregation_cycle(
+    *,
+    t: int,
+    selected: Sequence[int],
+    global_state: Mapping[str, torch.Tensor],
+    global_avg_grad: Mapping[str, torch.Tensor],
+    send_buffer: MutableMapping[int, BufferedUpdate],
+    drift_states: Mapping[int, Mapping[str, torch.Tensor]],
+    participation_count: MutableMapping[int, int],
+    base_global_lr: float,
+    age_threshold: float,
+    age_decay: float,
+    rho: float,
+    global_grad_momentum: float,
+) -> Tuple[TensorDict, TensorDict, float, List[int]]:
+    """
+    Stage B of one SAFL-HACM aggregation cycle.
+
+    Call this AFTER the event simulator has advanced time enough that every
+    scheduled ED has produced an update and placed it in send_buffer.
+
+    Implements:
+      Eq. (19) stale-drift correction
+      Eq. (6)  age-aware global learning rate
+      Eq. (4)-(5) global pseudo-gradient aggregation
+      Eq. (14) global average-gradient update
+    """
+    missing = [k for k in selected if k not in send_buffer]
+    if missing:
+        raise RuntimeError(
+            "Selected EDs are not ready after advancing the aggregation cycle: "
+            f"{missing}"
+        )
+
+    corrected_updates: List[BufferedUpdate] = []
+    ages: List[int] = []
+
+    for k in selected:
+        upd = send_buffer[k]
+        age = update_age(t, upd.start_round)
+        ages.append(age)
+
+        corrected_grad = stale_drift_correction(
+            pseudo_grad=upd.pseudo_grad,
+            drift_state=drift_states[k],
+            age=age,
+            rho=rho,
+        )
+        corrected_updates.append(
+            BufferedUpdate(
+                client_id=upd.client_id,
+                start_round=upd.start_round,
+                pseudo_grad=corrected_grad,
+                local_steps=upd.local_steps,
+                local_lr=upd.local_lr,
+                local_loss=upd.local_loss,
+                num_samples=upd.num_samples,
+            )
+        )
+
+    eta_t = age_aware_global_lr(
+        base_lr=base_global_lr,
+        ages=ages,
+        age_threshold=age_threshold,
+        decay=age_decay,
+    )
+
+    delta_t = aggregate_pseudogradient(corrected_updates)
+    next_global = global_model_update(global_state, delta_t, eta_t)
+    next_global_avg_grad = update_global_average_gradient(
+        previous=global_avg_grad,
+        selected_updates=corrected_updates,
+        mu=global_grad_momentum,
+    )
+
+    for k in selected:
+        participation_count[k] = participation_count.get(k, 0) + 1
+        del send_buffer[k]
+
+    return next_global, next_global_avg_grad, eta_t, ages
+
+
+# ---------------------------------------------------------------------
+# Recommended server-round skeleton
+# ---------------------------------------------------------------------
+
+def run_server_round(
+    *,
+    t: int,
+    global_state: Mapping[str, torch.Tensor],
+    global_avg_grad: Mapping[str, torch.Tensor],
+    send_buffer: MutableMapping[int, BufferedUpdate],
+    cluster_of: Mapping[int, int],
+    all_client_ids: Sequence[int],
+    participation_count: MutableMapping[int, int],
+    remaining_compute: Mapping[int, float],
+    estimated_comm_latency: Mapping[int, float],
+    alpha_comm: Mapping[int, float],
+    drift_states: Mapping[int, Mapping[str, torch.Tensor]],
+    R: int,
+    kappa: int,
+    base_global_lr: float,
+    age_threshold: float,
+    age_decay: float,
+    rho: float,
+    global_grad_momentum: float,
+    total_bandwidth: float,
+) -> Tuple[TensorDict, TensorDict, List[int], Dict[int, float], float]:
+    """
+    One paper-aligned ES iteration.
+
+    Notes:
+    - If selected non-ready clients exist, their updates must be made available by
+      the event simulator after their remaining local computation finishes.
+      This function therefore expects send_buffer to contain the actual updates
+      before aggregation. In a full simulator, schedule -> advance time -> collect
+      finished selected updates -> call aggregation.
     """
 
-    model.eval()
-    loss, total, correct = 0.0, 0.0, 0.0
+    # 1) Keep valid buffered updates; do NOT clear all unselected updates.
+    discard_stale_buffered_updates(send_buffer, t, kappa)
 
-    device = 'cuda' if args.gpu else 'cpu'
-    if args.dataset == 'mnist' or args.dataset == 'fmnist':
-        criterion = nn.NLLLoss().to(device)
-    else:
-        # criterion = nn.CrossEntropyLoss().to(device)
-        criterion = nn.NLLLoss().to(device)
+    ready_ids = set(send_buffer.keys())
+    nonready_ids = [k for k in all_client_ids if k not in ready_ids]
 
-    testloader = DataLoader(test_dataset, batch_size=1024,
-                            shuffle=False)
+    local_losses = {k: send_buffer[k].local_loss for k in ready_ids}
 
-    for batch_idx, (images, labels) in enumerate(testloader):
-        images, labels = images.to(device), labels.to(device)
+    # 2) Cluster-balanced / participation-aware scheduling.
+    selected = cluster_balanced_schedule(
+        cluster_of=cluster_of,
+        ready_ids=ready_ids,
+        nonready_ids=nonready_ids,
+        local_losses=local_losses,
+        participation_count=participation_count,
+        remaining_compute=remaining_compute,
+        estimated_comm_latency=estimated_comm_latency,
+        R=R,
+    )
 
-        # Inference
-        outputs = model(images)
-        batch_loss = criterion(outputs, labels)
-        loss += batch_loss.item()
+    # If this simple round function is called before an event simulator has made
+    # waiting-client updates available, aggregate the ready subset only.
+    selected_ready = [k for k in selected if k in send_buffer]
+    if not selected_ready:
+        return clone_state(global_state), clone_state(global_avg_grad), [], {}, 0.0
 
-        # Prediction
-        _, pred_labels = torch.max(outputs, 1)
-        pred_labels = pred_labels.view(-1)
-        correct += torch.sum(torch.eq(pred_labels, labels)).item()
-        total += len(labels)
+    # 3) Bandwidth allocation. For selected-ready only, H_cp is usually zero.
+    bw, H_t = latency_aware_bandwidth_allocation(
+        selected=selected_ready,
+        total_bandwidth=total_bandwidth,
+        alpha=alpha_comm,
+        remaining_compute={k: 0.0 for k in selected_ready},
+    )
 
-    accuracy = correct/total
-    return accuracy, loss/len(testloader)
-a = 0.8 #年龄模型超参数
-if __name__=='__main__':
-    args = args_parser()
-    seed = args.seed
-    random.seed(seed)
-    np.random.seed(seed)
+    # 4) Age-dependent correction before aggregation.
+    corrected_updates: List[BufferedUpdate] = []
+    ages: List[int] = []
 
-    if args.gpu:
-        torch.cuda.set_device(int(args.gpu))
-    device = 'cuda' if args.gpu else 'cpu'
+    for k in selected_ready:
+        upd = send_buffer[k]
+        age = update_age(t, upd.start_round)
+        ages.append(age)
 
-    #加载数据集
-    train_dataset, test_dataset, user_groups = get_dataset(args)
+        corrected = stale_drift_correction(
+            pseudo_grad=upd.pseudo_grad,
+            drift_state=drift_states[k],
+            age=age,
+            rho=rho,
+        )
 
-    #创建全局模型
-    if args.dataset == 'mnist' or args.dataset == 'fmnist':
-        global_model = CNNMnist(args)
-        ## 加载初始模型
-        global_model.load_state_dict(torch.load("./save/origin_model.pth"))
-    else:
-        global_model = CNNCifar()
-        global_model.load_state_dict(torch.load("./save/CNNcifar.pth"))
+        corrected_updates.append(
+            BufferedUpdate(
+                client_id=upd.client_id,
+                start_round=upd.start_round,
+                pseudo_grad=corrected,
+                local_steps=upd.local_steps,
+                local_lr=upd.local_lr,
+                local_loss=upd.local_loss,
+                num_samples=upd.num_samples,
+            )
+        )
 
-    global_model.to(device)
+    # 5) Paper Eq. (6): age-aware global learning rate.
+    eta_t = age_aware_global_lr(
+        base_lr=base_global_lr,
+        ages=ages,
+        age_threshold=age_threshold,
+        decay=age_decay,
+    )
 
-    #复制全局模型参数
-    global_weights = global_model.state_dict()
-    #边缘设备
-    devices = []
-    #lables向量
-    vectors = []
+    # 6) Paper Eq. (4)-(5): weighted pseudo-gradient aggregation.
+    delta_t = aggregate_pseudogradient(corrected_updates)
+    next_global = global_model_update(global_state, delta_t, eta_t)
 
-    #边缘设备传输能力
-    channel_cap = get_transmission_rate(args.num_devices)
-    #完成本地训练的总时间
-    whole_times = get_local_time(args.num_devices)  
-    #每个边缘设备训练完成还需要多少时间
-    remain_times = copy.deepcopy(whole_times)              
-    for id in range(args.num_devices):
-        ds = Edge_Device(args, id, user_groups[id], train_dataset)
-        devices.append(ds)
-        vectors.append(ds.get_vector())
-    
-    #聚类
-    clusters, clusters_num = cluster(vectors)
-    print(clusters)
-    #边缘设备分类
-    for id in range(args.num_devices):
-        devices[id].kind = clusters[id]
-    print("Devices are ready")
-    #此轮被选择的边缘设备
-    choice_devices = []  
-    #初始化簇类
-    devices_kind = []    
-    for i in range(clusters_num):
-        devices_kind.append([])
-    #本地更新年龄
-    devices_age = []
-    #每轮训练时间
-    epochs_time = [0]   
-     #每轮正确率
-    epochs_acc =  [0]  
-    #每轮平均年龄
-    epochs_age = [0]
-    #已经做好上传准备的设备
-    current_devices = []  
-    #准备上传的信息
-    ready_weights = {}
-    ready_c = {}
-    ready_losses = {}
-    #最大聚合设备数量
-    R = max(int(args.frac * args.num_devices), 1) 
-    #上一轮是否参加更新
-    last_update = []    
-    # 全局模型缓冲区
-    global_buffer = {}
+    # 7) Paper Eq. (14): global average gradient.
+    next_global_avg_grad = update_global_average_gradient(
+        previous=global_avg_grad,
+        selected_updates=corrected_updates,
+        mu=global_grad_momentum,
+    )
 
-    global_buffer[0] = copy.deepcopy(global_weights)
+    # 8) Participation counts and send-buffer maintenance.
+    for k in selected_ready:
+        participation_count[k] = participation_count.get(k, 0) + 1
+        del send_buffer[k]
 
-    # 全局校正项
-    global_c = copy.deepcopy(global_weights)
-    for key in global_c.keys():
-        global_c[key].zero_()
-
-    num_devices = args.num_devices
-    for idx in range(num_devices):
-        #下载全局模型
-        devices[idx].weight_download(0, copy.deepcopy(global_weights), copy.deepcopy(global_c))
-        #开始本地训练
-        devices[idx].local_train()
-        last_update.append(0)
-            #第一轮需要等待
-    sorted_time = sorted(whole_times)
-    T = sorted_time[20]
-    update_age = {} #上传模型的年龄
-    for idx in range(num_devices):
-        remain_times[idx] = remain_times[idx] - T
-        #完成本地训练，存储上传信息
-        if remain_times[idx] <= 0:
-            device = devices[idx]
-            devices_kind[device.kind].append(idx)
-            loss = device.send_loss()
-            weights, K= device.send_weight()
-            current_devices.append(idx)
-            ready_weights[idx] = copy.deepcopy(weights)
-            ready_c[idx] = K
-            ready_losses[idx] = loss
-            update_age[idx] = device.global_age
-    #每轮时间
-    epochs_time[0] = T
-    #年龄敏感参数
-    ALU = {} 
-    #年龄容忍度
-    stale = args.stale
-    select_times = []
-    for i in range(num_devices):
-        select_times.append(1)
-    b = 1
-    beta1 = 0.6
-    beta2 = 0.9
-    epsilon = 1e-8
-    mt = copy.deepcopy(global_weights)
-    mt_1 = copy.deepcopy(global_weights)
-    mt_0 = copy.deepcopy(global_weights)
-    vt = copy.deepcopy(global_weights)
-    vt_1 = copy.deepcopy(global_weights)
-    for key in mt.keys():
-        mt[key].zero_()
-        mt_1[key].zero_()
-        mt_0[key].zero_()
-        vt[key].zero_()
-        vt_1[key].zero_()
-    
-    #全局训练
-    for round in tqdm(range(args.epochs)):
-        print(f'\n | Global Training Round : {round} |\n')
-        global_model.train()
-        aggregation_idx = []
-
-        devices_kind1 = copy.deepcopy(devices_kind)
-        # 删除超过容忍度的信息
-        for i in range(10):
-            for idx in devices_kind[i]:
-                if round - update_age[idx] > stale:
-                    devices_kind1[i].remove(idx)
-        devices_kind = copy.deepcopy(devices_kind1)
-        print(devices_kind)
-        # print(ready_losses)
-        r = R
-        #调度设备
-        aggregation_idx = schedule(devices_kind, clusters_num,last_update, ready_losses, select_times, R)
-
-        print(aggregation_idx)
-        st = []
-        for idx in aggregation_idx:
-            st.append(select_times[idx])
-        print(st)
-        # 带宽分配
-        T = Bandwidth_Allocation(aggregation_idx, channel_cap)
-        print("传输时间 = ", T)
-        
-        # 平均权重
-        ww = {}
-        for idx in aggregation_idx:
-            ww[idx] = 1.0 / R
-
-        total_age = 0
-        ages = []
-        for idx in aggregation_idx:
-            total_age += round - update_age[idx]
-            ages.append(round - update_age[idx])
-        avg = total_age / R
-        print("平均年龄 = ", total_age / R)
-        d = 1
-        if avg > 2:
-            d = 0.6
-        lr = d * 0.5
-        
-        # 伪梯度计算
-        g_weights = ALU_aggregation_weight(ww, aggregation_idx, ready_weights)
-        g_c = Aggregation_Weight_g(ww, aggregation_idx, ready_weights, ready_c)
-
-        if round == 0:
-            global_c = copy.deepcopy(g_c)
-        else:
-            for key in g_c.keys():
-                global_c[key] = 0.6 * global_c[key] + 0.4 * g_c[key]
-
-        for key in global_weights.keys():
-            global_weights[key] = global_weights[key] + lr * g_weights[key]
-
-        global_buffer[ (round + 1)%10 ] = copy.deepcopy(global_weights)
-        ## 更新全局模型
-        global_model.load_state_dict(global_weights)    
-        #此轮延时
-        epochs_time.append(epochs_time[-1] + T)     
-        #测试集acc,loss
-        test_acc, test_loss = test_inference(args, global_model, test_dataset)
-        epochs_acc.append(test_acc)
-        print("Round = ", round, "Accuracy = ", test_acc, "Loss = ", test_loss, "Time = ", epochs_time[-1])
-
-        #标记未被选用过
-        for idx in range(num_devices):
-            last_update[idx] = 0
-        
-        # 标记上一轮是否已经被聚合过,次数加1
-        for idx in aggregation_idx:
-            last_update[idx] = 1
-            select_times[idx] += 1
-
-        # 从准备集中删除被聚合过的客户
-        for idx in aggregation_idx:
-            ready_c[idx] = 0
-            ready_weights[idx] = 0
-            devices[idx].send_nonempty = 0
-            devices_kind[devices[idx].kind].remove(idx)
-        for k in range(len(devices_kind)):
-            devices_kind[k] = []
-
-
-        ## 通信时，其他设备继续训练
-        for idx in range(num_devices):
-            if idx in aggregation_idx:
-                continue
-            remain_times[idx] = remain_times[idx] - T
-            if remain_times[idx] <= 0 :#在周期内能完成本地训练
-                device = devices[idx]
-                loss = device.send_loss()
-                weights, K = device.send_weight()
-                ready_weights[idx] = copy.deepcopy(weights)
-                ready_c[idx] = K
-                ready_losses[idx] = loss
-                if idx not in devices_kind[device.kind]:
-                    devices_kind[device.kind].append(idx)
-                current_devices.append(idx)
-                update_age[idx] = device.global_age
-
-        for idx in current_devices:
-            if devices[idx].nonempty == 1:
-                devices[idx].local_train()
-                remain_times[idx] = max(remain_times[idx] + whole_times[idx], 0)
-            else :
-                remain_times[idx] = whole_times[idx]
-        total_ALU = 0
-        # 下载全局模型
-        for idx in range(num_devices):
-            devices[idx].weight_download(round + 1, global_weights, global_c)
-        # 开始新的本地训练
-        for idx in current_devices:
-            devices[idx].local_train()
-        current_devices = []
-        with open('./save/AFLDCh_le{}_iid{}_ds_{}_dir{}.csv'.format(args.local_ep, args.iid, args.dataset, args.dir), mode='a', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow([round, test_acc, test_loss, epochs_time[-1]])
-    n = 0
-    
-
-    end = time.time()
-
-
+    return next_global, next_global_avg_grad, selected_ready, bw, H_t
